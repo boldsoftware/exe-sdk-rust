@@ -88,6 +88,7 @@ pub(crate) struct Transport {
     token: String,
     http: reqwest::Client,
     retries: u32,
+    user_agent: reqwest::header::HeaderValue,
 }
 
 impl std::fmt::Debug for Transport {
@@ -111,7 +112,7 @@ impl Transport {
                 .bearer_auth(&self.token)
                 .header(reqwest::header::CONTENT_TYPE, "text/plain")
                 .header(reqwest::header::ACCEPT, "application/json, application/x-ndjson")
-                .header(reqwest::header::USER_AGENT, USER_AGENT)
+                .header(reqwest::header::USER_AGENT, self.user_agent.clone())
                 .body(body.to_string())
                 .send()
                 .await?;
@@ -447,6 +448,7 @@ pub struct ClientBuilder {
     base_url: Option<String>,
     http: Option<reqwest::Client>,
     retries: Option<u32>,
+    user_agent: Option<String>,
 }
 
 impl ClientBuilder {
@@ -478,8 +480,20 @@ impl ClientBuilder {
         self
     }
 
+    /// Names the product built on the SDK in the User-Agent header of
+    /// every request, so that exe.dev can tell its traffic apart: a product
+    /// token, such as `"t3exe/0.1.1"`, which comes before the SDK's own,
+    /// making the header `"t3exe/0.1.1 exedev-rust/0.1.0"`. By default the
+    /// header is the SDK's alone. It may be visible ASCII, with spaces or
+    /// tabs between parts; [`build`](Self::build) fails if it is not.
+    pub fn user_agent(mut self, product: impl Into<String>) -> Self {
+        self.user_agent = Some(product.into());
+        self
+    }
+
     /// The client.
     pub fn build(self) -> Result<Client> {
+        let user_agent = user_agent(self.user_agent.as_deref())?;
         let token = match self.token {
             Some(t) => t,
             None => std::env::var("EXE_TOKEN").unwrap_or_default(),
@@ -509,15 +523,46 @@ impl ClientBuilder {
                 token,
                 http,
                 retries: self.retries.unwrap_or(5),
+                user_agent,
             }),
         })
     }
+}
+
+/// The User-Agent header: the caller's product, if any, then the SDK.
+fn user_agent(product: Option<&str>) -> Result<reqwest::header::HeaderValue> {
+    let Some(product) = product else {
+        return Ok(reqwest::header::HeaderValue::from_static(USER_AGENT));
+    };
+    // The same rule as the other exe.dev SDKs: visible ASCII, with spaces
+    // or tabs only between parts (^[\x21-\x7e]+(?:[ \t]+[\x21-\x7e]+)*$).
+    if product.is_empty() {
+        return Err(Error::Config(
+            "the user agent is empty: name a product, such as \"my-tool/1.0\", or leave it unset".into(),
+        ));
+    }
+    if let Some(c) = product
+        .chars()
+        .find(|c| !(c.is_ascii_graphic() || *c == ' ' || *c == '\t'))
+    {
+        return Err(Error::Config(format!(
+            "the user agent {product:?} has {c:?}, which an HTTP header cannot carry"
+        )));
+    }
+    if !product.starts_with(|c: char| c.is_ascii_graphic()) || !product.ends_with(|c: char| c.is_ascii_graphic()) {
+        return Err(Error::Config(format!(
+            "the user agent {product:?} starts or ends with whitespace"
+        )));
+    }
+    reqwest::header::HeaderValue::from_str(&format!("{product} {USER_AGENT}"))
+        .map_err(|_| Error::Config(format!("the user agent {product:?} is not a valid HTTP header value")))
 }
 
 impl std::fmt::Debug for ClientBuilder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ClientBuilder")
             .field("base_url", &self.base_url)
+            .field("user_agent", &self.user_agent)
             .finish_non_exhaustive()
     }
 }
@@ -553,27 +598,71 @@ mod tests {
         assert_eq!(USER_AGENT, format!("exedev-rust/{VERSION}"));
     }
 
-    #[tokio::test]
-    async fn requests_say_which_sdk_sent_them() {
+    /// The headers of the request a client built with this builder sends.
+    async fn request_headers(builder: ClientBuilder) -> Vec<(String, String)> {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let server = tokio::spawn(serve_one(listener, r#"{"email":"a@example.com"}"#));
-        let exe = Client::builder().token("test-token").base_url(base).build().unwrap();
+        let exe = builder.token("test-token").base_url(base).build().unwrap();
         let result = exe.exec("whoami").await.unwrap();
         assert_eq!(result["email"], "a@example.com");
         let head = server.await.unwrap();
-        let headers: Vec<(String, String)> = head
-            .lines()
+        assert!(head.starts_with("POST /exec "), "{head}");
+        head.lines()
             .skip(1)
             .filter_map(|l| l.split_once(':'))
             .map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_string()))
-            .collect();
-        let header = |name: &str| headers.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str());
-        assert!(head.starts_with("POST /exec "), "{head}");
-        assert_eq!(
-            header("user-agent"),
-            Some(format!("exedev-rust/{}", env!("CARGO_PKG_VERSION")).as_str())
-        );
-        assert_eq!(header("authorization"), Some("Bearer test-token"));
+            .collect()
+    }
+
+    fn header<'h>(headers: &'h [(String, String)], name: &str) -> Vec<&'h str> {
+        headers
+            .iter()
+            .filter(|(k, _)| k == name)
+            .map(|(_, v)| v.as_str())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn requests_say_which_sdk_sent_them() {
+        let headers = request_headers(Client::builder()).await;
+        let sdk = format!("exedev-rust/{}", env!("CARGO_PKG_VERSION"));
+        assert_eq!(header(&headers, "user-agent"), [sdk.as_str()]);
+        assert_eq!(header(&headers, "authorization"), ["Bearer test-token"]);
+    }
+
+    #[tokio::test]
+    async fn requests_say_which_product_sent_them_first() {
+        let headers = request_headers(Client::builder().user_agent("t3exe/0.1.1")).await;
+        let want = format!("t3exe/0.1.1 exedev-rust/{}", env!("CARGO_PKG_VERSION"));
+        assert_eq!(header(&headers, "user-agent"), [want.as_str()]);
+    }
+
+    #[test]
+    fn user_agents_must_fit_in_a_header() {
+        let sdk = format!("exedev-rust/{VERSION}");
+        assert_eq!(user_agent(None).unwrap(), sdk.as_str());
+        let ua = user_agent(Some("my-tool/2.0 (+https://example.com)")).unwrap();
+        assert_eq!(ua, format!("my-tool/2.0 (+https://example.com) {sdk}").as_str());
+        let ua = user_agent(Some("a/1\tb/2")).unwrap();
+        assert_eq!(ua, format!("a/1\tb/2 {sdk}").as_str());
+        let bad = [
+            "",
+            " ",
+            " a/1",
+            "a/1 ",
+            "a/1\t",
+            "t3exe/1\r\nX-Evil: 1",
+            "t3exe/1\n",
+            "caf\u{e9}/1",
+            "nul\0",
+            "del\x7f",
+        ];
+        for bad in bad {
+            let err = Client::builder().token("t").user_agent(bad).build().unwrap_err();
+            assert!(matches!(err, Error::Config(_)), "{bad:?}: {err:?}");
+        }
+        let err = Client::builder().token("t").user_agent("a\r\nb").build().unwrap_err();
+        assert_eq!(err.to_string().lines().count(), 1, "{err}");
     }
 }

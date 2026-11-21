@@ -243,8 +243,13 @@ let exe = exedev::Client::builder()
     .base_url("https://exe.dev")
     .http_client(reqwest::Client::builder().proxy(proxy).build()?)
     .max_retries(5)                         // retries of rate-limited requests, with backoff
+    .user_agent("my-tool/1.2")              // User-Agent: my-tool/1.2 exedev-rust/0.1.0
     .build()?;
 ```
+
+If you build a tool on the SDK, name it with `.user_agent()`, a product
+token like `"my-tool/1.2"`: requests then say they came from your tool,
+through this SDK. Without it, the User-Agent is the SDK's alone.
 
 Pass your own `reqwest::Client` for proxies, custom TLS, or tests. A `Client`
 is cheap to clone, and can be shared between tasks.
