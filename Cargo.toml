@@ -1,0 +1,42 @@
+[package]
+name = "exedev"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Official Rust SDK for exe.dev: create VMs, run commands on them, and run every exe.dev command"
+license = "MIT"
+authors = ["Bold Software, Inc."]
+repository = "https://github.com/boldsoftware/exe-sdk-rust"
+homepage = "https://exe.dev"
+documentation = "https://docs.rs/exedev"
+readme = "README.md"
+keywords = ["exe", "vm", "sdk", "cloud", "ssh"]
+categories = ["api-bindings", "asynchronous"]
+exclude = ["/scripts", "/.github"]
+
+[package.metadata.docs.rs]
+all-features = true
+
+[features]
+blocking = []
+
+[dependencies]
+base64 = "0.23"
+bytes = "1"
+flate2 = "1"
+futures-util = "0.3"
+glob = "0.3"
+rand = "0.10"
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream", "http2", "system-proxy"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tar = "0.4"
+thiserror = "2"
+tokio = { version = "1", features = ["rt", "time", "sync", "macros", "rt-multi-thread"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+
+[[example]]
+name = "blocking"
+required-features = ["blocking"]
